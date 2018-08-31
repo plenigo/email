@@ -559,7 +559,19 @@ func headerToBytes(buff *bytes.Buffer, header textproto.MIMEHeader) {
 			case field == "Content-Type" || field == "Content-Disposition":
 				buff.Write([]byte(subval))
 			default:
-				buff.Write([]byte(mime.QEncoding.Encode("UTF-8", subval)))
+				headerText := ""
+				if strings.Contains(subval, "<") {
+					mailAddressParts := strings.Split(subval, " <")
+					if len(mailAddressParts) == 2 {
+						headerText = mime.QEncoding.Encode("UTF-8", mailAddressParts[0])
+						headerText += " <" + mailAddressParts[1]
+					} else {
+						headerText = mime.QEncoding.Encode("UTF-8", subval)
+					}
+				} else {
+					headerText = mime.QEncoding.Encode("UTF-8", subval)
+				}
+				buff.Write([]byte(headerText))
 			}
 			io.WriteString(buff, "\r\n")
 		}
