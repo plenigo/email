@@ -39,6 +39,7 @@ var ErrMissingContentType = errors.New("No Content-Type found for MIME entity")
 
 // Email is the type used for email messages
 type Email struct {
+	ReplyTo     []string
 	From        string
 	To          []string
 	Bcc         []string
@@ -94,18 +95,47 @@ func NewEmailFromReader(r io.Reader) (*Email, error) {
 		switch {
 		case h == "Subject":
 			e.Subject = v[0]
+			subj, err := (&mime.WordDecoder{}).DecodeHeader(e.Subject)
+			if err == nil && len(subj) > 0 {
+				e.Subject = subj
+			}
 			delete(hdrs, h)
 		case h == "To":
-			e.To = v
+			for _, to := range v {
+				tt, err := (&mime.WordDecoder{}).DecodeHeader(to)
+				if err == nil {
+					e.To = append(e.To, tt)
+				} else {
+					e.To = append(e.To, to)
+				}
+			}
 			delete(hdrs, h)
 		case h == "Cc":
-			e.Cc = v
+			for _, cc := range v {
+				tcc, err := (&mime.WordDecoder{}).DecodeHeader(cc)
+				if err == nil {
+					e.Cc = append(e.Cc, tcc)
+				} else {
+					e.Cc = append(e.Cc, cc)
+				}
+			}
 			delete(hdrs, h)
 		case h == "Bcc":
-			e.Bcc = v
+			for _, bcc := range v {
+				tbcc, err := (&mime.WordDecoder{}).DecodeHeader(bcc)
+				if err == nil {
+					e.Bcc = append(e.Bcc, tbcc)
+				} else {
+					e.Bcc = append(e.Bcc, bcc)
+				}
+			}
 			delete(hdrs, h)
 		case h == "From":
 			e.From = v[0]
+			fr, err := (&mime.WordDecoder{}).DecodeHeader(e.From)
+			if err == nil && len(fr) > 0 {
+				e.From = fr
+			}
 			delete(hdrs, h)
 		}
 	}
@@ -167,6 +197,9 @@ func parseMIMEParts(hs textproto.MIMEHeader, b io.Reader) ([]*part, error) {
 				p.Header.Set("Content-Type", defaultContentType)
 			}
 			subct, _, err := mime.ParseMediaType(p.Header.Get("Content-Type"))
+			if err != nil {
+				return ps, err
+			}
 			if strings.HasPrefix(subct, "multipart/") {
 				sps, err := parseMIMEParts(p.Header, p)
 				if err != nil {
@@ -212,11 +245,9 @@ func (e *Email) Attach(r io.Reader, filename string, c string) (a *Attachment, e
 		Header:   textproto.MIMEHeader{},
 		Content:  buffer.Bytes(),
 	}
-	// Get the Content-Type to be used in the MIMEHeader
 	if c != "" {
 		at.Header.Set("Content-Type", c)
 	} else {
-		// If the Content-Type is blank, set the Content-Type to "application/octet-stream"
 		at.Header.Set("Content-Type", "application/octet-stream")
 	}
 	at.Header.Set("Content-Disposition", fmt.Sprintf("attachment;\r\n filename=\"%s\"", filename))
@@ -251,13 +282,16 @@ func (e *Email) AttachFile(filename string) (a *Attachment, err error) {
 func (e *Email) msgHeaders() (textproto.MIMEHeader, error) {
 	res := make(textproto.MIMEHeader, len(e.Headers)+4)
 	if e.Headers != nil {
-		for _, h := range []string{"To", "Cc", "From", "Subject", "Date", "Message-Id", "MIME-Version"} {
+		for _, h := range []string{"Reply-To", "To", "Cc", "From", "Subject", "Date", "Message-Id", "MIME-Version"} {
 			if v, ok := e.Headers[h]; ok {
 				res[h] = v
 			}
 		}
 	}
 	// Set headers if there are values.
+	if _, ok := res["Reply-To"]; !ok && len(e.ReplyTo) > 0 {
+		res.Set("Reply-To", strings.Join(e.ReplyTo, ", "))
+	}
 	if _, ok := res["To"]; !ok && len(e.To) > 0 {
 		res.Set("To", strings.Join(e.To, ", "))
 	}
@@ -292,7 +326,7 @@ func (e *Email) msgHeaders() (textproto.MIMEHeader, error) {
 	return res, nil
 }
 
-func writeMessage(buff *bytes.Buffer, msg []byte, multipart bool, mediaType string, w *multipart.Writer) error {
+func writeMessage(buff io.Writer, msg []byte, multipart bool, mediaType string, w *multipart.Writer) error {
 	if multipart {
 		header := textproto.MIMEHeader{
 			"Content-Type":              {mediaType + "; charset=UTF-8"},
@@ -343,7 +377,10 @@ func (e *Email) Bytes() ([]byte, error) {
 		headers.Set("Content-Transfer-Encoding", "quoted-printable")
 	}
 	headerToBytes(buff, headers)
-	io.WriteString(buff, "\r\n")
+	_, err = io.WriteString(buff, "\r\n")
+	if err != nil {
+		return nil, err
+	}
 
 	// Check to see if there is a Text or HTML field
 	if len(e.Text) > 0 || len(e.HTML) > 0 {
@@ -468,9 +505,13 @@ func (e *Email) SendWithTLS(addr string, a smtp.Auth, t *tls.Config) error {
 	if err != nil {
 		return err
 	}
-	// Taken from the standard library
-	// https://github.com/golang/go/blob/master/src/net/smtp/smtp.go#L300
-	c, err := smtp.Dial(addr)
+
+	conn, err := tls.Dial("tcp", addr, t)
+	if err != nil {
+		return err
+	}
+
+	c, err := smtp.NewClient(conn, t.ServerName)
 	if err != nil {
 		return err
 	}
@@ -548,7 +589,7 @@ func base64Wrap(w io.Writer, b []byte) {
 
 // headerToBytes renders "header" to "buff". If there are multiple values for a
 // field, multiple "Field: value\r\n" lines will be emitted.
-func headerToBytes(buff *bytes.Buffer, header textproto.MIMEHeader) {
+func headerToBytes(buff io.Writer, header textproto.MIMEHeader) {
 	for field, vals := range header {
 		for _, subval := range vals {
 			// bytes.Buffer.Write() never returns an error.
